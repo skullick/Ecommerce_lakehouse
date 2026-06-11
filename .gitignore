@@ -1,0 +1,34 @@
+# Secrets
+.env
+
+# Virtual Environments
+.venv/
+env/
+venv/
+pyrightconfig.json
+.vscode/
+.idea/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Docker Volumes & Local DB Data
+postgres-data/
+postgres-data/
+postgres-init/
+setup.sql
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+
+# Dags
+dags/
+
+# Tests
+test.*
+scratch/

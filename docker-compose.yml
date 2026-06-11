@@ -1,0 +1,392 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: lakehouse-postgres
+    command: postgres -c wal_level=logical -c max_wal_senders=1 -c max_replication_slots=1
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: lakehouse-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - lakehouse-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: lakehouse-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  connect:
+    image: quay.io/debezium/connect:2.4
+    container_name: lakehouse-debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:29092
+      - GROUP_ID=1
+      - CONFIG_STORAGE_TOPIC=my_connect_configs
+      - OFFSET_STORAGE_TOPIC=my_connect_offsets
+      - STATUS_STORAGE_TOPIC=my_connect_statuses
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
+    networks:
+      - lakehouse-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: lakehouse-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+      - KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME=debezium
+      - KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS=http://connect:8083
+    networks:
+      - lakehouse-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio-setup:
+    image: python:3.10-slim
+    container_name: minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    volumes:
+      - ./init-scripts/bucket_setup.py:/init/bucket_setup.py
+    command: >
+      /bin/sh -c "
+      pip install minio &&
+      python /init/bucket_setup.py
+      "
+    networks:
+      - lakehouse-net
+      
+  polaris-db:
+    image: postgres:15-alpine
+    container_name: polaris-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POLARIS_DB_USER}
+      POSTGRES_PASSWORD: ${POLARIS_DB_PASSWORD}
+      POSTGRES_DB: ${POLARIS_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - polaris-db:/var/lib/postgresql/data
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polaris"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  polaris:
+    image: apache/polaris:1.3.0-incubating
+    container_name: polaris
+    restart: unless-stopped
+    depends_on:
+      polaris-db:
+        condition: service_healthy
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # https://polaris.apache.org/releases/1.3.0/metastores/
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://${POLARIS_DB_HOST}:${POLARIS_DB_PORT}/${POLARIS_DB}
+      QUARKUS_DATASOURCE_USERNAME: ${POLARIS_DB_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD}
+      # https://polaris.apache.org/releases/1.3.0/configuring-polaris-for-production/#realm-context-resolver
+      polaris.realm-context.realms: ${REALM_NAME}
+      polaris.realm-context.header-name: Polaris-Realm
+      polaris.realm-context.require-header: false
+      # https://polaris.apache.org/in-dev/unreleased/configuration/configuration-reference/
+      polaris.features."DROP_WITH_PURGE_ENABLED": true
+    ports:
+      - "8181:8181"
+      - "8182:8182"
+    networks:
+      - lakehouse-net
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  polaris-admin-tool:
+    image: apache/polaris-admin-tool:1.3.0-incubating
+    container_name: polaris-admin-tool
+    depends_on:
+      polaris-db:
+        condition: service_healthy
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://${POLARIS_DB_HOST}:${POLARIS_DB_PORT}/${POLARIS_DB}
+      QUARKUS_DATASOURCE_USERNAME: ${POLARIS_DB_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD}
+      REALM_NAME: ${REALM_NAME}
+      CLIENT_ID: ${CLIENT_ID}
+      CLIENT_SECRET: ${CLIENT_SECRET}
+    volumes:
+      - polaris-bootstrap-flag:/tmp
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        FLAG=/tmp/.bootstrapped
+        if [ -f "$$FLAG" ]; then
+          echo "Already bootstrapped, skipping!"
+          exit 0
+        fi
+        java -jar /deployments/polaris-admin-tool.jar bootstrap \
+          -r ${REALM_NAME} \
+          -c ${REALM_NAME},${CLIENT_ID},${CLIENT_SECRET}
+        echo "Bootstrap done!!!" > $$FLAG
+        echo "REALM_NAME=${REALM_NAME}" >> $$FLAG
+        echo "ROOT_CLIENT_ID=${CLIENT_ID}" >> $$FLAG
+        echo "ROOT_CLIENT_SECRET=${CLIENT_SECRET}" >> $$FLAG
+    networks:
+      - lakehouse-net
+
+  polaris-setup:
+    image: python:3.10-slim
+    container_name: polaris-setup
+    depends_on:
+      polaris-admin-tool:
+        condition: service_completed_successfully
+      minio-setup:
+        condition: service_completed_successfully
+    environment:
+      POLARIS_HOST: ${POLARIS_HOST}
+      POLARIS_PORT: ${POLARIS_PORT}
+      REALM_NAME: ${REALM_NAME}
+      CLIENT_ID: ${CLIENT_ID}
+      CLIENT_SECRET: ${CLIENT_SECRET}
+      CATALOG_NAME: ${CATALOG_NAME}
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      CREDENTIALS_FILE: /credentials/polaris-user.env
+    volumes:
+      - ./init-scripts/polaris_setup.py:/init/polaris_setup.py
+      - polaris-credentials:/credentials
+    command: >
+      /bin/sh -c "
+      pip install requests &&
+      python /init/polaris_setup.py
+      "
+    networks:
+      - lakehouse-net
+
+  trino:
+    image: trinodb/trino:476
+    container_name: trino
+    ports:
+      - "8080:8080"
+    environment:
+      POLARIS_HOST: ${POLARIS_HOST}
+      POLARIS_PORT: ${POLARIS_PORT}
+      REALM_NAME: ${REALM_NAME}
+      CATALOG_NAME: ${CATALOG_NAME}
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      CREDENTIALS_FILE: /credentials/polaris-user.env
+    volumes:
+      - ./docker/trino/etc:/etc/trino
+      - ./docker/trino/entrypoint.sh:/usr/local/bin/trino-entrypoint.sh
+      - polaris-credentials:/credentials:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/trino-entrypoint.sh"]
+    networks:
+      - lakehouse-net
+  
+  spark-notebook:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    image: my-pyspark-notebook:latest
+    container_name: spark-notebook
+    ports:
+      - "8888:8888"         # Jupyter Lab UI
+      - "4040:4040"         # Spark UI (driver)
+    environment:
+      POLARIS_HOST: ${POLARIS_HOST}
+      POLARIS_PORT: ${POLARIS_PORT}
+      REALM_NAME: ${REALM_NAME}
+      CATALOG_NAME: ${CATALOG_NAME}
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      CREDENTIALS_FILE: /credentials/polaris-user.env
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./docker/spark/conf:/usr/local/spark/conf
+      - ./docker/spark/entrypoint.sh:/usr/local/bin/spark-entrypoint.sh
+      - polaris-credentials:/credentials:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/spark-entrypoint.sh"]
+    networks:
+      - lakehouse-net
+
+  airflow-db:
+    image: postgres:13-alpine
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow_password
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    networks:
+      - lakehouse-net
+
+  airflow-init:
+    image: apache/airflow:2.10.2
+    container_name: airflow-init
+    depends_on:
+      - airflow-db
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow_password@airflow-db/airflow
+      - _AIRFLOW_DB_UPGRADE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+      - AIRFLOW__WEBSERVER__SECRET_KEY=lakehouse_secret_key_12345
+    command: version
+    networks:
+      - lakehouse-net
+
+  airflow-webserver:
+    image: apache/airflow:2.10.2
+    container_name: airflow-webserver
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow_password@airflow-db/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__WEBSERVER__SECRET_KEY=lakehouse_secret_key_12345
+    ports:
+      - "8082:8080"
+    command: webserver
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./notebooks:/opt/airflow/notebooks
+    networks:
+      - lakehouse-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.2
+    container_name: airflow-scheduler
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow_password@airflow-db/airflow
+      - AIRFLOW__WEBSERVER__SECRET_KEY=lakehouse_secret_key_12345
+    command: scheduler
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./notebooks:/opt/airflow/notebooks
+      - /var/run/docker.sock:/var/run/docker.sock # Allow Airflow to trigger docker commands
+    networks:
+      - lakehouse-net
+
+volumes:
+  airflow-db-data:
+    name: airflow-db-data
+  minio-data:
+    name: minio-data
+  polaris-db:
+    name: polaris-db
+  polaris-credentials:
+    name: polaris-credentials
+  polaris-bootstrap-flag:
+    name: polaris-bootstrap-flag
+
+networks:
+  lakehouse-net:
+    name: lakehouse-net

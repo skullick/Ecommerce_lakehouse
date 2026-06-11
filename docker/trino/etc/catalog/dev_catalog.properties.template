@@ -1,0 +1,23 @@
+# The name of the file is used as the catalog name only in Trino.
+# It can be different from the catalog name defined in Polaris.
+
+
+# https://trino.io/docs/current/object-storage/metastores.html#rest-catalog
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://${POLARIS_HOST}:${POLARIS_PORT}/api/catalog
+iceberg.rest-catalog.warehouse=${CATALOG_NAME}
+
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.server-uri=http://${POLARIS_HOST}:${POLARIS_PORT}/api/catalog/v1/oauth/tokens
+iceberg.rest-catalog.oauth2.credential=${USER_CLIENT_ID}:${USER_CLIENT_SECRET}
+iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+
+
+# https://trino.io/docs/current/object-storage/file-system-s3.html
+fs.native-s3.enabled=true
+s3.endpoint=http://${MINIO_HOST}:${MINIO_PORT}
+s3.aws-access-key=${MINIO_ROOT_USER}
+s3.aws-secret-key=${MINIO_ROOT_PASSWORD}
+s3.path-style-access=true
+s3.region=us-east-1

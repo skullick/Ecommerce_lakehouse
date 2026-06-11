@@ -1,0 +1,24 @@
+{
+  "postgres": {
+    "host": "localhost",
+    "port": 5433,
+    "user": "postgres",
+    "password": "postgres_password"
+  },
+  "kafka": {
+    "bootstrap_servers": "localhost:9092",
+    "topic_clickstream": "clickstream_logs"
+  },
+  "simulation": {
+    "users_daily_active_count": 100,
+    "events_per_session_range": [3, 15],
+    "probabilities": {
+      "page_view": 0.50,
+      "search": 0.20,
+      "add_to_cart": 0.15,
+      "remove_from_cart": 0.05,
+      "checkout": 0.08,
+      "purchase": 0.02
+    }
+  }
+}
